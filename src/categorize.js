@@ -1,7 +1,9 @@
+import * as chrono from 'chrono-node'
+
 const CATEGORIES = {
   Health: {
     keywords: [
-      'appointment', 'doctor', 'gp', 'dentist', 'dentist', 'hospital', 'clinic',
+      'appointment', 'doctor', 'gp', 'dentist', 'hospital', 'clinic',
       'medicine', 'medication', 'prescription', 'pharmacy', 'gym', 'workout',
       'exercise', 'run', 'jog', 'yoga', 'therapy', 'therapist', 'health',
       'medical', 'nurse', 'physio', 'optician', 'optometrist', 'blood test',
@@ -50,55 +52,86 @@ const CATEGORIES = {
   },
 }
 
-const SCHEDULED_KEYWORDS = [
-  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
-  'today', 'tomorrow', 'tonight', 'next week', 'this week', 'next month',
-  'january', 'february', 'march', 'april', 'may', 'june',
-  'july', 'august', 'september', 'october', 'november', 'december',
-  'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec',
-  'morning', 'afternoon', 'evening',
-  /\b\d{1,2}(st|nd|rd|th)?\b/, // matches "15th", "3rd", "1st", etc.
-  /\b\d{1,2}[\/\-]\d{1,2}\b/, // matches "15/4", "3-12"
-]
+function pad(n) {
+  return String(n).padStart(2, '0')
+}
 
-function extractScheduledDay(text) {
+// Format a Date's local date part as YYYY-MM-DD (no timezone shift).
+function toDateString(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+// UK-style parser so "15/4" reads as 15 April, not April 15.
+const parser = chrono.en.GB
+
+// Resolve a bare ordinal day ("the 25th", "on the 3rd") to the next
+// occurrence of that day-of-month — chrono ignores these on their own.
+function parseBareOrdinal(text, ref) {
+  const m = text.toLowerCase().match(/\b(?:on |by |the )?(\d{1,2})(st|nd|rd|th)\b/)
+  if (!m) return null
+  const day = parseInt(m[1], 10)
+  if (day < 1 || day > 31) return null
+
+  const d = new Date(ref.getFullYear(), ref.getMonth(), day)
+  if (d.getMonth() !== ref.getMonth() || d < new Date(ref.getFullYear(), ref.getMonth(), ref.getDate())) {
+    // Day already passed this month (or overflowed) → roll to next month.
+    d.setFullYear(ref.getFullYear(), ref.getMonth() + 1, day)
+  }
+  return toDateString(d)
+}
+
+/**
+ * Parse a natural-language due date/time out of free text using chrono.
+ * Returns { dueDate: 'YYYY-MM-DD'|null, dueTime: 'HH:MM'|null }.
+ * dueTime is only set when the user gave an explicit clock time
+ * (e.g. "7am", "at 15:30") — vague words like "afternoon" leave it null.
+ */
+export function parseDueDate(text, ref = new Date()) {
+  const results = parser.parse(text, ref, { forwardDate: true })
+  if (!results.length) {
+    return { dueDate: parseBareOrdinal(text, ref), dueTime: null }
+  }
+
+  const start = results[0].start
+  const dueDate = toDateString(start.date())
+
+  const hasTime = start.isCertain('hour')
+  const dueTime = hasTime
+    ? `${pad(start.get('hour'))}:${pad(start.get('minute') || 0)}`
+    : null
+
+  return { dueDate, dueTime }
+}
+
+// Detect a simple recurrence from phrasing like "daily", "every week",
+// "every Monday". Returns 'daily' | 'weekly' | null.
+export function detectRecurrence(text) {
   const lower = text.toLowerCase()
-
-  // Check regex patterns
-  for (const kw of SCHEDULED_KEYWORDS) {
-    if (kw instanceof RegExp) {
-      const match = text.match(kw)
-      if (match) return match[0]
-      continue
-    }
-    if (lower.includes(kw)) {
-      // Capitalize first letter
-      return kw.charAt(0).toUpperCase() + kw.slice(1)
-    }
+  if (/\b(every day|everyday|daily|each day)\b/.test(lower)) return 'daily'
+  if (
+    /\b(every week|weekly|each week)\b/.test(lower) ||
+    /\bevery (monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(lower)
+  ) {
+    return 'weekly'
   }
   return null
 }
 
-export function categorizeTask(text) {
+export function categorizeTask(text, ref = new Date()) {
   const lower = text.toLowerCase()
 
-  // Score each category
-  const scores = {}
-  for (const [cat, { keywords }] of Object.entries(CATEGORIES)) {
-    scores[cat] = keywords.reduce((acc, kw) => acc + (lower.includes(kw) ? 1 : 0), 0)
-  }
-
-  // Pick highest scoring category, default to Personal
+  // Score each category by keyword hits; default to Personal.
   let bestCat = 'Personal'
   let bestScore = 0
-  for (const [cat, score] of Object.entries(scores)) {
+  for (const [cat, { keywords }] of Object.entries(CATEGORIES)) {
+    const score = keywords.reduce((acc, kw) => acc + (lower.includes(kw) ? 1 : 0), 0)
     if (score > bestScore) {
       bestScore = score
       bestCat = cat
     }
   }
 
-  const scheduledDay = extractScheduledDay(text)
-
-  return { category: bestCat, scheduledDay }
+  const { dueDate, dueTime } = parseDueDate(text, ref)
+  const recurrence = detectRecurrence(text)
+  return { category: bestCat, dueDate, dueTime, recurrence }
 }

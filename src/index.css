@@ -1,16 +1,67 @@
 @import "tailwindcss";
 
+/* Manual dark-mode: `dark:` variants respond to a .dark class on <html>,
+   which useDarkMode toggles (defaulting to the system preference). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 * {
   box-sizing: border-box;
 }
 
+html,
 body {
   margin: 0;
+  height: 100%;
+}
+
+body {
   font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
-  background: #f8f9fa;
   -webkit-font-smoothing: antialiased;
+  /* App-like: no rubber-band scroll on the page itself, no tap flash. */
+  overscroll-behavior-y: none;
+  -webkit-tap-highlight-color: transparent;
+  background: #f5f3ff;
+  color: #1e293b;
+}
+
+:where(.dark) body {
+  background: #0f172a;
+  color: #e2e8f0;
 }
 
 #root {
   min-height: 100svh;
+}
+
+/* Pop when a task is completed. */
+@keyframes task-complete {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.03); }
+  100% { transform: scale(1); }
+}
+.animate-complete {
+  animation: task-complete 0.28s ease;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.animate-spin-slow {
+  animation: spin 0.7s linear infinite;
+}
+
+/* Toast slide-up. */
+@keyframes toast-in {
+  from { transform: translateY(120%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.animate-toast-in {
+  animation: toast-in 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-complete,
+  .animate-toast-in {
+    animation: none;
+  }
 }
