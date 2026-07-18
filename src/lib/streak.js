@@ -54,6 +54,24 @@ export function getDoneToday() {
   return log[todayStr()] || 0
 }
 
+// Completions per day for the last 7 days (oldest → newest) for the chart.
+export function getWeekChart() {
+  const log = read(DONE_KEY, {})
+  const out = []
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date()
+    d.setDate(d.getDate() - i)
+    const p = (n) => String(n).padStart(2, '0')
+    const key = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+    out.push({
+      date: key,
+      label: d.toLocaleDateString(undefined, { weekday: 'narrow' }),
+      count: log[key] || 0,
+    })
+  }
+  return out
+}
+
 export function bumpDone(delta) {
   const log = read(DONE_KEY, {})
   const today = todayStr()

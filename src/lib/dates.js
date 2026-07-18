@@ -29,11 +29,18 @@ export function isDueToday(task) {
   return !!task.due_date && task.due_date === todayStr()
 }
 
-function to12h(hhmm) {
+export function to12h(hhmm) {
   const [h, m] = hhmm.split(':').map(Number)
   const period = h >= 12 ? 'pm' : 'am'
   const h12 = h % 12 === 0 ? 12 : h % 12
   return m === 0 ? `${h12}${period}` : `${h12}:${pad(m)}${period}`
+}
+
+// "3–4pm" style range for events; falls back to a single time.
+export function formatTimeRange(start, end) {
+  if (!start) return null
+  if (!end) return to12h(start.slice(0, 5))
+  return `${to12h(start.slice(0, 5))}–${to12h(end.slice(0, 5))}`
 }
 
 // A short, human label for a task's due date, e.g. "Today · 7am",
@@ -57,7 +64,9 @@ export function formatDue(task) {
     })
   }
 
-  const timeLabel = task.due_time ? to12h(task.due_time.slice(0, 5)) : null
+  const timeLabel = task.due_time
+    ? formatTimeRange(task.due_time, task.end_time)
+    : null
   const base = timeLabel ? `${dayLabel} · ${timeLabel}` : dayLabel
   return isOverdue(task) && diffDays < 0 ? `Overdue · ${base}` : base
 }
@@ -67,4 +76,35 @@ export function addDays(dateStr, n) {
   const d = new Date(`${dateStr}T00:00:00`)
   d.setDate(d.getDate() + n)
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+// Advance a YYYY-MM-DD string by n months, clamping to month length.
+export function addMonths(dateStr, n) {
+  const d = new Date(`${dateStr}T00:00:00`)
+  const day = d.getDate()
+  d.setDate(1)
+  d.setMonth(d.getMonth() + n)
+  const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()
+  d.setDate(Math.min(day, lastDay))
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+// The next n calendar days as YYYY-MM-DD, starting today (for the week view).
+export function nextDays(n) {
+  const start = todayStr()
+  return Array.from({ length: n }, (_, i) => addDays(start, i))
+}
+
+// Friendly heading for a date column, e.g. "Today", "Tomorrow", "Sat 25 Jul".
+export function dayHeading(dateStr) {
+  const diff = Math.round(
+    (new Date(dateStr + 'T00:00:00') - new Date(todayStr() + 'T00:00:00')) / 86400000,
+  )
+  if (diff === 0) return 'Today'
+  if (diff === 1) return 'Tomorrow'
+  return new Date(dateStr + 'T00:00:00').toLocaleDateString(undefined, {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+  })
 }
