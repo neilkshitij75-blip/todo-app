@@ -6,10 +6,15 @@ function pad(n) {
 }
 
 function icsDate(dateStr, timeStr) {
-  const [y, m, d] = dateStr.split('-')
-  if (!timeStr) return `${y}${m}${d}` // all-day (VALUE=DATE)
+  // All-day: a floating calendar date, no timezone involved.
+  if (!timeStr) return dateStr.replace(/-/g, '') // YYYYMMDD (VALUE=DATE)
+
+  // Timed: the stored time is wall-clock in the user's own timezone (the
+  // device the app runs on). Interpret it locally and emit UTC (…Z) so the
+  // calendar shows the correct instant — DST-aware, so CET and CEST both work.
   const [hh, mm] = timeStr.slice(0, 5).split(':')
-  return `${y}${m}${d}T${hh}${mm}00`
+  const local = new Date(`${dateStr}T${hh}:${mm}:00`)
+  return local.toISOString().slice(0, 19).replace(/[-:]/g, '') + 'Z' // YYYYMMDDTHHMMSSZ
 }
 
 function escapeText(s = '') {
