@@ -1,405 +1,536 @@
 import { useState, useEffect, useRef } from 'react'
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  TouchSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core'
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
 import { supabase } from './supabase'
-import { categorizeTask } from './categorize'
+import { parseInput } from './categorize'
+import { dueSortValue, isOverdue, isDueToday, todayStr, nextDays, dayHeading } from './lib/dates'
+import { nextDueDate } from './lib/recurrence'
+import { recordVisit, getDoneToday, bumpDone } from './lib/streak'
+import { buildICS, downloadText } from './lib/ics'
+import { exportJSON, parseImport } from './lib/backup'
+import { useDarkMode } from './hooks/useDarkMode'
+import ItemCard from './components/ItemCard'
+import DetailSheet from './components/DetailSheet'
+import AddBar from './components/AddBar'
+import StatsView from './components/StatsView'
+import Toast from './components/Toast'
 import './index.css'
 
-const TABS = [
-  { id: 'Health',    emoji: '🏥', label: 'Health' },
-  { id: 'Errands',   emoji: '🛒', label: 'Errands' },
-  { id: 'Work',      emoji: '💼', label: 'Work' },
-  { id: 'Study',     emoji: '🎓', label: 'Study' },
-  { id: 'Personal',  emoji: '🏠', label: 'Personal' },
-  { id: 'Scheduled', emoji: '📅', label: 'Scheduled' },
+const NAV = [
+  { id: 'today', emoji: '📌', label: 'Today' },
+  { id: 'lists', emoji: '🗂️', label: 'Lists' },
+  { id: 'week', emoji: '📅', label: 'Week' },
+  { id: 'ideas', emoji: '💡', label: 'Ideas' },
+  { id: 'stats', emoji: '📊', label: 'Stats' },
 ]
+const CATEGORIES = ['Health', 'Errands', 'Work', 'Study', 'Personal']
+const LIST_BUCKETS = ['All', ...CATEGORIES, 'Someday']
 
-function TaskCard({ task, onToggle, onDelete }) {
-  return (
-    <div
-      className={`flex items-start gap-3 p-4 bg-white rounded-xl shadow-sm border transition-all duration-300 ${
-        task.completed ? 'opacity-50 border-gray-100' : 'border-gray-100 hover:shadow-md'
-      }`}
-    >
-      <button
-        onClick={() => onToggle(task)}
-        className={`mt-0.5 w-5 h-5 rounded-full border-2 flex-shrink-0 flex items-center justify-center transition-all duration-200 cursor-pointer ${
-          task.completed
-            ? 'bg-emerald-500 border-emerald-500'
-            : 'border-gray-300 hover:border-emerald-400'
-        }`}
-      >
-        {task.completed && (
-          <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-          </svg>
-        )}
-      </button>
-
-      <div className="flex-1 min-w-0">
-        <p className={`text-sm leading-relaxed ${task.completed ? 'line-through text-gray-400' : 'text-gray-700'}`}>
-          {task.text}
-        </p>
-        {task.scheduled_day && (
-          <span className="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 bg-blue-50 text-blue-600 text-xs rounded-full font-medium">
-            📅 {task.scheduled_day}
-          </span>
-        )}
-      </div>
-
-      <button
-        onClick={() => onDelete(task.id)}
-        className="flex-shrink-0 w-6 h-6 flex items-center justify-center text-gray-300 hover:text-red-400 hover:bg-red-50 rounded-full transition-all duration-150 text-lg leading-none cursor-pointer"
-        aria-label="Delete task"
-      >
-        ×
-      </button>
-    </div>
-  )
+function byManualOrder(a, b) {
+  if (a.completed !== b.completed) return a.completed ? 1 : -1
+  const ao = a.sort_order ?? Infinity
+  const bo = b.sort_order ?? Infinity
+  if (ao !== bo) return ao - bo
+  return new Date(b.created_at) - new Date(a.created_at)
+}
+function byDue(a, b) {
+  if (a.completed !== b.completed) return a.completed ? 1 : -1
+  return dueSortValue(a) - dueSortValue(b)
 }
 
 export default function App() {
   const [tasks, setTasks] = useState([])
-  const [activeTab, setActiveTab] = useState('Health')
-  const [input, setInput] = useState('')
+  const [view, setView] = useState('today')
+  const [bucket, setBucket] = useState('All')
+  const [search, setSearch] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const [adding, setAdding] = useState(false)
   const [error, setError] = useState(null)
-  const inputRef = useRef(null)
+  const [toast, setToast] = useState(null)
+  const [detail, setDetail] = useState(null)
+  const [stats, setStats] = useState(() => ({ streak: recordVisit(), done: getDoneToday() }))
+
+  const [isDark, toggleDark] = useDarkMode()
+  const deleteTimers = useRef({})
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 120, tolerance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  )
 
   useEffect(() => {
-    fetchTasks()
+    async function loadTasks() {
+      setLoading(true)
+      const { data, error } = await supabase.from('tasks').select('*')
+      if (error) {
+        setError('Failed to load tasks. Check your Supabase credentials in .env.local')
+        console.error(error)
+      } else {
+        setTasks(data || [])
+        setError(null)
+      }
+      setLoading(false)
+    }
+    loadTasks()
   }, [])
 
-  async function fetchTasks() {
-    setLoading(true)
-    const { data, error } = await supabase
-      .from('tasks')
-      .select('*')
-      .order('created_at', { ascending: false })
-
-    if (error) {
-      setError('Failed to load tasks. Check your Supabase credentials in .env.local')
-      console.error(error)
-    } else {
-      setTasks(data || [])
-    }
-    setLoading(false)
+  function showToast(message, onUndo) {
+    setToast({ message, onUndo })
   }
 
-  async function addTask(e) {
-    e.preventDefault()
-    const text = input.trim()
-    if (!text || adding) return
-
+  // ---- Add (optimistic; works offline via client-generated id) ----
+  async function addItem(raw, type) {
     setAdding(true)
     setError(null)
-    const { category, scheduledDay } = categorizeTask(text)
-
-    const newTask = {
-      text,
-      category,
-      scheduled_day: scheduledDay,
+    const parsed = parseInput(raw, { type })
+    const minOrder = tasks.reduce((m, t) => Math.min(m, t.sort_order ?? 0), 0)
+    const id = crypto.randomUUID()
+    const row = {
+      id,
+      text: parsed.title,
+      type: parsed.type,
+      category: parsed.category,
+      due_date: parsed.dueDate,
+      due_time: parsed.dueTime,
+      end_time: parsed.endTime,
+      recur: parsed.recur,
+      recurrence: parsed.recurrence,
+      tags: parsed.tags,
+      notes: null,
+      subtasks: [],
       completed: false,
+      priority: false,
+      someday: false,
+      sort_order: minOrder - 1,
+      created_at: new Date().toISOString(),
     }
+    setTasks((prev) => [row, ...prev])
 
-    const { data, error } = await supabase
-      .from('tasks')
-      .insert([newTask])
-      .select()
-      .single()
+    // Route the view so the new item is visible.
+    if (parsed.type === 'note') setView('ideas')
+    else if (isOverdue(row) || isDueToday(row)) setView('today')
+    else { setView('lists'); setBucket('All') }
 
+    const { data, error } = await supabase.from('tasks').insert([row]).select().single()
     if (error) {
+      // Offline / no backend: keep the optimistic row (SW will replay the write).
       console.error(error)
-      setError('Failed to add task. Check your Supabase credentials.')
-    } else {
-      setTasks(prev => [data, ...prev])
-      setInput('')
-      setActiveTab(scheduledDay ? 'Scheduled' : category)
+    } else if (data) {
+      setTasks((prev) => prev.map((t) => (t.id === id ? data : t)))
     }
     setAdding(false)
-    inputRef.current?.focus()
   }
 
-  async function toggleTask(task) {
-    const updated = { completed: !task.completed }
-    const { error } = await supabase
-      .from('tasks')
-      .update(updated)
-      .eq('id', task.id)
+  // ---- Complete (+ recurrence spawn + haptics + stats) ----
+  function toggleTask(task) {
+    return setCompleted(task, !task.completed)
+  }
+  async function setCompleted(task, nowComplete, { spawn = true, toast = true } = {}) {
+    if (nowComplete) {
+      navigator.vibrate?.(15)
+      setStats((s) => ({ ...s, done: bumpDone(1) }))
+    } else {
+      setStats((s) => ({ ...s, done: bumpDone(-1) }))
+    }
+    setTasks((prev) => prev.map((t) => (t.id === task.id ? { ...t, completed: nowComplete } : t)))
+    const { error } = await supabase.from('tasks').update({ completed: nowComplete }).eq('id', task.id)
+    if (error) console.error(error)
 
-    if (!error) {
-      setTasks(prev =>
-        prev.map(t => (t.id === task.id ? { ...t, ...updated } : t))
+    if (nowComplete && spawn) await spawnNextOccurrence(task)
+    if (toast && nowComplete) {
+      showToast('Completed', () => setCompleted(task, false, { spawn: false, toast: false }))
+    }
+  }
+
+  async function spawnNextOccurrence(task) {
+    const next = nextDueDate(task)
+    if (!next) return
+    const id = crypto.randomUUID()
+    const row = {
+      ...task,
+      id,
+      due_date: next,
+      completed: false,
+      subtasks: (task.subtasks || []).map((s) => ({ ...s, done: false })),
+      sort_order: (task.sort_order ?? 0) - 0.5,
+      created_at: new Date().toISOString(),
+    }
+    setTasks((prev) => [row, ...prev])
+    const { data, error } = await supabase.from('tasks').insert([row]).select().single()
+    if (error) console.error(error)
+    else if (data) setTasks((prev) => prev.map((t) => (t.id === id ? data : t)))
+  }
+
+  // ---- Delete (soft, with undo) ----
+  function deleteTask(task) {
+    setTasks((prev) => prev.filter((t) => t.id !== task.id))
+    if (detail?.id === task.id) setDetail(null)
+    showToast('Deleted', () => {
+      clearTimeout(deleteTimers.current[task.id])
+      delete deleteTimers.current[task.id]
+      setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)])
+    })
+    deleteTimers.current[task.id] = setTimeout(async () => {
+      delete deleteTimers.current[task.id]
+      const { error } = await supabase.from('tasks').delete().eq('id', task.id)
+      if (error) {
+        console.error(error)
+        setTasks((prev) => [task, ...prev.filter((t) => t.id !== task.id)])
+      }
+    }, 4200)
+  }
+
+  // ---- Update (from detail sheet) ----
+  async function updateItem(id, patch) {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)))
+    setDetail((d) => (d && d.id === id ? { ...d, ...patch } : d))
+    const { error } = await supabase.from('tasks').update(patch).eq('id', id)
+    if (error) console.error(error)
+  }
+  const editTitle = (id, text) => updateItem(id, { text })
+  const toggleStar = (task) => updateItem(task.id, { priority: !task.priority })
+
+  async function clearCompleted(list) {
+    const ids = list.filter((t) => t.completed).map((t) => t.id)
+    if (!ids.length) return
+    setTasks((prev) => prev.filter((t) => !ids.includes(t.id)))
+    const { error } = await supabase.from('tasks').delete().in('id', ids)
+    if (error) console.error(error)
+  }
+
+  // ---- Carry overdue tasks to today (Plan my day) ----
+  async function carryOverdue() {
+    const overdue = tasks.filter((t) => isOverdue(t))
+    if (!overdue.length) return
+    const today = todayStr()
+    const ids = overdue.map((t) => t.id)
+    setTasks((prev) => prev.map((t) => (ids.includes(t.id) ? { ...t, due_date: today } : t)))
+    await Promise.all(
+      ids.map((id) => supabase.from('tasks').update({ due_date: today }).eq('id', id)),
+    ).catch((e) => console.error(e))
+    showToast(`Moved ${ids.length} to today`)
+  }
+
+  // ---- Drag reorder ----
+  async function onDragEnd(event, ordered) {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+    const oldIndex = ordered.findIndex((t) => t.id === active.id)
+    const newIndex = ordered.findIndex((t) => t.id === over.id)
+    if (oldIndex < 0 || newIndex < 0) return
+    const reordered = arrayMove(ordered, oldIndex, newIndex)
+    const updates = reordered.map((t, i) => ({ id: t.id, sort_order: i }))
+    setTasks((prev) =>
+      prev.map((t) => {
+        const u = updates.find((x) => x.id === t.id)
+        return u ? { ...t, sort_order: u.sort_order } : t
+      }),
+    )
+    await Promise.all(
+      updates.map((u) => supabase.from('tasks').update({ sort_order: u.sort_order }).eq('id', u.id)),
+    ).catch((e) => console.error(e))
+  }
+
+  // ---- Export / import ----
+  function onExportICS() {
+    downloadText('my-tasks.ics', buildICS(tasks), 'text/calendar')
+    showToast('Calendar exported')
+  }
+  async function onImportJSON(file) {
+    try {
+      const rows = parseImport(await file.text())
+      const withIds = rows.map((r) => ({ ...r, id: crypto.randomUUID() }))
+      setTasks((prev) => [...withIds, ...prev])
+      await supabase.from('tasks').insert(withIds)
+      showToast(`Imported ${withIds.length} items`)
+    } catch (e) {
+      console.error(e)
+      setError('Import failed — not a valid backup file.')
+    }
+  }
+
+  // ---- Derived lists ----
+  const q = search.trim().toLowerCase()
+  const searchResults = q
+    ? tasks.filter((t) =>
+        [t.text, t.notes, ...(t.tags || [])].filter(Boolean).some((s) => s.toLowerCase().includes(q)),
+      ).sort(byDue)
+    : null
+
+  function todayItems() {
+    return tasks
+      .filter((t) => !t.completed && t.type !== 'note' && (isOverdue(t) || isDueToday(t)))
+      .sort(byDue)
+  }
+  function bucketItems() {
+    if (bucket === 'Someday') return tasks.filter((t) => t.someday && t.type !== 'note').sort(byManualOrder)
+    if (bucket === 'All') return tasks.filter((t) => t.type !== 'note' && !t.someday).sort(byManualOrder)
+    return tasks.filter((t) => t.type === 'task' && t.category === bucket && !t.someday).sort(byManualOrder)
+  }
+  function ideaItems() {
+    return tasks.filter((t) => t.type === 'note').sort(byManualOrder)
+  }
+  function weekGroups() {
+    return nextDays(7).map((date) => ({
+      date,
+      items: tasks
+        .filter((t) => !t.completed && t.due_date === date)
+        .sort((a, b) => dueSortValue(a) - dueSortValue(b)),
+    }))
+  }
+
+  const cardHandlers = {
+    onToggle: toggleTask,
+    onDelete: deleteTask,
+    onEditTitle: editTitle,
+    onToggleStar: toggleStar,
+    onOpen: setDetail,
+  }
+
+  function List({ items, draggable }) {
+    const ul = (
+      <ul className="mx-auto flex max-w-xl flex-col gap-2">
+        {items.map((item) => (
+          <ItemCard key={item.id} item={item} draggable={draggable && !item.completed} {...cardHandlers} />
+        ))}
+      </ul>
+    )
+    if (!draggable) return ul
+    return (
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(e) => onDragEnd(e, items)}>
+        <SortableContext items={items.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+          {ul}
+        </SortableContext>
+      </DndContext>
+    )
+  }
+
+  function Empty({ emoji, title, hint }) {
+    return (
+      <div className="py-16 text-center text-slate-400 dark:text-slate-500">
+        <div className="mb-3 text-5xl">{emoji}</div>
+        <p className="text-sm">{title}</p>
+        {hint && <p className="mt-1 text-xs">{hint}</p>}
+      </div>
+    )
+  }
+
+  // ---- Render main content ----
+  function content() {
+    if (searchResults) {
+      return searchResults.length ? (
+        <List items={searchResults} draggable={false} />
+      ) : (
+        <Empty emoji="🔍" title="No matches." hint={`Nothing found for “${search.trim()}”.`} />
       )
     }
-  }
 
-  async function deleteTask(id) {
-    const { error } = await supabase.from('tasks').delete().eq('id', id)
-    if (!error) {
-      setTasks(prev => prev.filter(t => t.id !== id))
+    if (view === 'stats') {
+      return (
+        <StatsView
+          tasks={tasks}
+          stats={stats}
+          isDark={isDark}
+          onToggleDark={toggleDark}
+          onExportJSON={() => { exportJSON(tasks); showToast('Backup downloaded') }}
+          onExportICS={onExportICS}
+          onImportJSON={onImportJSON}
+        />
+      )
     }
-  }
 
-  async function clearCompleted(tab) {
-    const toDelete = tabTasks(tab)
-      .filter(t => t.completed)
-      .map(t => t.id)
-
-    if (!toDelete.length) return
-
-    const { error } = await supabase
-      .from('tasks')
-      .delete()
-      .in('id', toDelete)
-
-    if (!error) {
-      setTasks(prev => prev.filter(t => !toDelete.includes(t.id)))
-    }
-  }
-
-  function tabTasks(tabId) {
-    if (tabId === 'Scheduled') {
-      return tasks.filter(t => t.scheduled_day)
-    }
-    return tasks.filter(t => t.category === tabId)
-  }
-
-  function activeCount(tabId) {
-    return tabTasks(tabId).filter(t => !t.completed).length
-  }
-
-  const currentTasks = tabTasks(activeTab)
-  const completedCount = currentTasks.filter(t => t.completed).length
-
-  return (
-    <div style={{ minHeight: '100svh', background: 'linear-gradient(135deg, #f8fafc 0%, #eff6ff 100%)', display: 'flex', flexDirection: 'column' }}>
-      {/* Header */}
-      <header style={{ padding: '32px 16px 16px', textAlign: 'center' }}>
-        <h1 style={{ margin: 0, fontSize: 24, fontWeight: 600, color: '#1e293b', letterSpacing: '-0.5px' }}>
-          My Tasks
-        </h1>
-        <p style={{ margin: '4px 0 0', fontSize: 13, color: '#94a3b8' }}>
-          Type naturally — I'll sort it out
-        </p>
-      </header>
-
-      {/* Error banner */}
-      {error && (
-        <div style={{
-          margin: '0 16px 8px',
-          padding: '12px 16px',
-          background: '#fef2f2',
-          border: '1px solid #fecaca',
-          borderRadius: 12,
-          color: '#dc2626',
-          fontSize: 13,
-          textAlign: 'center',
-        }}>
-          {error}
-        </div>
-      )}
-
-      {/* Tab bar */}
-      <div style={{ padding: '0 16px', overflowX: 'auto' }}>
-        <div style={{
-          display: 'flex',
-          gap: 4,
-          maxWidth: 640,
-          margin: '0 auto',
-          paddingBottom: 4,
-          width: 'max-content',
-          minWidth: '100%',
-          justifyContent: 'center',
-        }}>
-          {TABS.map(tab => {
-            const count = activeCount(tab.id)
-            const isActive = activeTab === tab.id
-            return (
+    if (view === 'today') {
+      const items = todayItems()
+      const overdue = tasks.filter((t) => isOverdue(t)).length
+      const events = items.filter((t) => t.type === 'event').length
+      return (
+        <div className="mx-auto max-w-xl">
+          <div className="mb-3 rounded-2xl border border-slate-200/70 bg-white p-4 dark:border-slate-700 dark:bg-slate-800">
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              {items.length === 0
+                ? 'Nothing due today. 🎉'
+                : `${items.length} due today${events ? ` · ${events} event${events > 1 ? 's' : ''}` : ''}${overdue ? ` · ${overdue} overdue` : ''}.`}
+            </p>
+            {overdue > 0 && (
               <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  padding: '8px 12px',
-                  borderRadius: 12,
-                  fontSize: 12,
-                  fontWeight: 500,
-                  border: isActive ? '1px solid #e2e8f0' : '1px solid transparent',
-                  background: isActive ? '#ffffff' : 'transparent',
-                  color: isActive ? '#1e293b' : '#64748b',
-                  boxShadow: isActive ? '0 1px 3px rgba(0,0,0,0.08)' : 'none',
-                  cursor: 'pointer',
-                  whiteSpace: 'nowrap',
-                  transition: 'all 0.15s ease',
-                }}
+                onClick={carryOverdue}
+                className="mt-2 rounded-lg bg-violet-100 px-3 py-1.5 text-xs font-medium text-violet-700 hover:bg-violet-200 dark:bg-violet-500/20 dark:text-violet-300"
               >
-                <span>{tab.emoji}</span>
-                <span>{tab.label}</span>
-                {count > 0 && (
-                  <span style={{
-                    padding: '1px 6px',
-                    borderRadius: 999,
-                    fontSize: 11,
-                    fontWeight: 600,
-                    background: isActive ? '#dbeafe' : '#f1f5f9',
-                    color: isActive ? '#2563eb' : '#64748b',
-                  }}>
-                    {count}
-                  </span>
-                )}
+                ↪ Move {overdue} overdue to today
               </button>
-            )
-          })}
+            )}
+          </div>
+          {items.length ? <List items={items} draggable={false} /> : (
+            <Empty emoji="🎉" title="All clear for today." hint="Enjoy the calm — or capture something below." />
+          )}
         </div>
-      </div>
+      )
+    }
 
-      {/* Task list */}
-      <main style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 110px' }}>
-        <div style={{ maxWidth: 560, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {loading ? (
-            <div style={{ display: 'flex', justifyContent: 'center', padding: '64px 0', color: '#94a3b8' }}>
-              <div style={{
-                width: 24, height: 24,
-                border: '2px solid #e2e8f0',
-                borderTopColor: '#60a5fa',
-                borderRadius: '50%',
-                animation: 'spin 0.7s linear infinite',
-              }} />
-            </div>
-          ) : currentTasks.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: '64px 0', color: '#94a3b8' }}>
-              <div style={{ fontSize: 40, marginBottom: 12 }}>{TABS.find(t => t.id === activeTab)?.emoji}</div>
-              <p style={{ fontSize: 14, margin: '0 0 4px' }}>No tasks here yet.</p>
-              <p style={{ fontSize: 12, margin: 0 }}>Add one using the bar below.</p>
-            </div>
-          ) : (
+    if (view === 'lists') {
+      const items = bucketItems()
+      const completed = items.filter((t) => t.completed)
+      return (
+        <>
+          <div className="mx-auto mb-3 flex max-w-xl gap-1 overflow-x-auto">
+            {LIST_BUCKETS.map((b) => (
+              <button
+                key={b}
+                onClick={() => setBucket(b)}
+                className={`whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                  bucket === b
+                    ? 'bg-violet-100 text-violet-700 dark:bg-violet-500/20 dark:text-violet-300'
+                    : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'
+                }`}
+              >
+                {b}
+              </button>
+            ))}
+          </div>
+          {items.length ? (
             <>
-              {currentTasks.map(task => (
-                <TaskCard
-                  key={task.id}
-                  task={task}
-                  onToggle={toggleTask}
-                  onDelete={deleteTask}
-                />
-              ))}
-              {completedCount > 0 && (
-                <div style={{ textAlign: 'center', paddingTop: 8 }}>
-                  <button
-                    onClick={() => clearCompleted(activeTab)}
-                    style={{
-                      background: 'none',
-                      border: 'none',
-                      fontSize: 12,
-                      color: '#94a3b8',
-                      cursor: 'pointer',
-                      textDecoration: 'underline',
-                      textUnderlineOffset: 2,
-                    }}
-                    onMouseEnter={e => e.target.style.color = '#f87171'}
-                    onMouseLeave={e => e.target.style.color = '#94a3b8'}
-                  >
-                    Clear {completedCount} completed
+              <List items={items} draggable={bucket !== 'All' && bucket !== 'Someday'} />
+              {completed.length > 0 && (
+                <div className="mx-auto max-w-xl pt-3 text-center">
+                  <button onClick={() => clearCompleted(items)} className="text-xs text-slate-400 underline underline-offset-2 hover:text-red-400 dark:text-slate-500">
+                    Clear {completed.length} completed
                   </button>
                 </div>
               )}
             </>
+          ) : (
+            <Empty emoji="🗂️" title="Nothing here yet." hint="Add a task below." />
           )}
+        </>
+      )
+    }
+
+    if (view === 'week') {
+      const groups = weekGroups()
+      const any = groups.some((g) => g.items.length)
+      if (!any) return <Empty emoji="📅" title="Nothing scheduled this week." hint="Add an event or a dated task." />
+      return (
+        <div className="mx-auto flex max-w-xl flex-col gap-4">
+          {groups.map((g) => (
+            <div key={g.date}>
+              <div className="mb-1.5 px-1 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
+                {dayHeading(g.date)}
+              </div>
+              {g.items.length ? (
+                <List items={g.items} draggable={false} />
+              ) : (
+                <p className="px-1 text-xs text-slate-300 dark:text-slate-600">—</p>
+              )}
+            </div>
+          ))}
         </div>
+      )
+    }
+
+    if (view === 'ideas') {
+      const items = ideaItems()
+      return items.length ? (
+        <List items={items} draggable />
+      ) : (
+        <Empty emoji="💡" title="No ideas captured yet." hint="Switch the bar to “Note” and jot one down." />
+      )
+    }
+  }
+
+  return (
+    <div className="flex min-h-[100svh] flex-col bg-violet-50 dark:bg-slate-900">
+      <header className="px-4 pt-[calc(env(safe-area-inset-top)+20px)] pb-2">
+        <div className="mx-auto flex max-w-xl items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-800 dark:text-slate-100">My Agenda</h1>
+            <p className="mt-0.5 text-[13px] text-slate-400 dark:text-slate-500">
+              🔥 {stats.streak} day streak · {stats.done} done today
+            </p>
+          </div>
+          <button
+            onClick={() => { setSearchOpen((o) => !o); if (searchOpen) setSearch('') }}
+            aria-label="Search"
+            className="flex h-10 w-10 items-center justify-center rounded-full bg-white text-lg shadow-sm active:scale-95 dark:bg-slate-800"
+          >
+            🔍
+          </button>
+        </div>
+
+        {searchOpen && (
+          <div className="mx-auto mt-3 max-w-xl">
+            <input
+              autoFocus
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search tasks, notes, #tags…"
+              className="w-full rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 shadow-sm outline-none focus:border-violet-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+            />
+          </div>
+        )}
+      </header>
+
+      {error && (
+        <div className="mx-4 mb-2 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-center text-[13px] text-red-600 dark:border-red-500/40 dark:bg-red-500/10 dark:text-red-300">
+          {error}
+        </div>
+      )}
+
+      {/* primary nav */}
+      {!searchResults && (
+        <div className="overflow-x-auto px-4">
+          <div className="mx-auto flex w-max min-w-full max-w-xl justify-center gap-1 pb-1">
+            {NAV.map((n) => {
+              const active = view === n.id
+              return (
+                <button
+                  key={n.id}
+                  onClick={() => setView(n.id)}
+                  className={`flex items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+                    active
+                      ? 'border-slate-200 bg-white text-slate-800 shadow-sm dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100'
+                      : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-400'
+                  }`}
+                >
+                  <span>{n.emoji}</span>
+                  <span>{n.label}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      <main className="flex-1 overflow-y-auto px-4 pb-40 pt-4">
+        {loading ? (
+          <div className="flex justify-center py-16">
+            <div className="h-6 w-6 animate-spin-slow rounded-full border-2 border-slate-200 border-t-violet-400 dark:border-slate-700" />
+          </div>
+        ) : (
+          content()
+        )}
       </main>
 
-      {/* Input bar */}
-      <div style={{
-        position: 'fixed',
-        bottom: 0,
-        left: 0,
-        right: 0,
-        padding: 16,
-        background: 'rgba(255,255,255,0.85)',
-        backdropFilter: 'blur(12px)',
-        borderTop: '1px solid #f1f5f9',
-        boxShadow: '0 -4px 20px rgba(0,0,0,0.06)',
-      }}>
-        <form
-          onSubmit={addTask}
-          style={{ maxWidth: 560, margin: '0 auto', display: 'flex', gap: 8 }}
-        >
-          <input
-            ref={inputRef}
-            type="text"
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            placeholder="e.g. book a GP appointment on Monday…"
-            disabled={adding}
-            style={{
-              flex: 1,
-              padding: '12px 16px',
-              background: '#ffffff',
-              border: '1px solid #e2e8f0',
-              borderRadius: 12,
-              fontSize: 14,
-              color: '#374151',
-              outline: 'none',
-              boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
-              transition: 'border-color 0.15s',
-            }}
-            onFocus={e => e.target.style.borderColor = '#93c5fd'}
-            onBlur={e => e.target.style.borderColor = '#e2e8f0'}
-          />
-          <button
-            type="submit"
-            disabled={!input.trim() || adding}
-            style={{
-              padding: '12px 20px',
-              background: '#3b82f6',
-              color: '#ffffff',
-              border: 'none',
-              borderRadius: 12,
-              fontSize: 14,
-              fontWeight: 500,
-              cursor: input.trim() && !adding ? 'pointer' : 'not-allowed',
-              opacity: !input.trim() || adding ? 0.4 : 1,
-              boxShadow: '0 1px 3px rgba(59,130,246,0.3)',
-              transition: 'all 0.15s',
-              minWidth: 60,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            {adding ? (
-              <div style={{
-                width: 16, height: 16,
-                border: '2px solid rgba(255,255,255,0.4)',
-                borderTopColor: '#ffffff',
-                borderRadius: '50%',
-                animation: 'spin 0.7s linear infinite',
-              }} />
-            ) : 'Add'}
-          </button>
-        </form>
-      </div>
+      {view !== 'stats' && <AddBar onAdd={addItem} adding={adding} />}
 
-      <style>{`
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
-        .task-card {
-          display: flex;
-          align-items: flex-start;
-          gap: 12px;
-          padding: 16px;
-          background: white;
-          border-radius: 12px;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-          border: 1px solid #f1f5f9;
-          transition: all 0.2s;
-        }
-        .task-card:hover {
-          box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-        }
-      `}</style>
+      {detail && (
+        <DetailSheet key={detail.id} item={detail} onUpdate={updateItem} onDelete={deleteTask} onClose={() => setDetail(null)} />
+      )}
+      <Toast toast={toast} onUndo={() => setToast(null)} onDismiss={() => setToast(null)} />
     </div>
   )
 }
